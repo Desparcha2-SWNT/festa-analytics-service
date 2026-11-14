@@ -22,7 +22,11 @@ const msgWith = (envelope, exchange = 'festa.auth', headers = {}) => ({
   fields: { exchange },
 });
 function fakeDb(alreadyProcessed = false) {
-  const processed = { findOne: vi.fn().mockResolvedValue(alreadyProcessed ? { _id: 'x' } : null), updateOne: vi.fn() };
+  const duplicate = () => Promise.reject(Object.assign(new Error('E11000 duplicate key'), { code: 11000 }));
+  const processed = {
+    insertOne: vi.fn(alreadyProcessed ? duplicate : () => Promise.resolve()),
+    deleteOne: vi.fn().mockResolvedValue({ deletedCount: 1 }),
+  };
   return { collection: vi.fn(() => processed), processed };
 }
 const envelope = { eventId: 'e1', eventType: 'account.registered', producer: 'auth-service', data: { userId: 'u' } };
@@ -57,15 +61,26 @@ describe('handle', () => {
     expect(h.handler).not.toHaveBeenCalled();
   });
 
-  it('ejecuta el handler, marca el evento como procesado y confirma', async () => {
+  it('reclama el evento antes de ejecutar el handler y confirma', async () => {
     h.handler.mockReset().mockResolvedValue();
     const channel = fakeChannel();
     const db = fakeDb();
     const msg = msgWith(envelope);
     await _internal.handle(channel, msg, fakeRegistry(), db);
+    expect(db.processed.insertOne).toHaveBeenCalledWith(expect.objectContaining({ _id: 'e1' }));
+    expect(db.processed.insertOne.mock.invocationCallOrder[0]).toBeLessThan(h.handler.mock.invocationCallOrder[0]);
     expect(h.handler).toHaveBeenCalledWith(envelope.data, envelope, db);
-    expect(db.processed.updateOne).toHaveBeenCalled();
+    expect(db.processed.deleteOne).not.toHaveBeenCalled();
     expect(channel.ack).toHaveBeenCalledWith(msg);
+  });
+
+  it('si el handler falla, libera la reclamación para que el reintento sí se procese', async () => {
+    h.handler.mockReset().mockRejectedValue(new Error('mongo caído'));
+    const channel = fakeChannel();
+    channel.sendToQueue.mockImplementation((q, c, o, cb) => cb(null));
+    const db = fakeDb();
+    await _internal.handle(channel, msgWith(envelope), fakeRegistry(), db);
+    expect(db.processed.deleteOne).toHaveBeenCalledWith({ _id: 'e1' });
   });
 
   it('un duplicado se confirma sin repetir el efecto', async () => {

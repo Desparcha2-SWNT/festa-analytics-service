@@ -68,6 +68,26 @@ export async function eventStats(eventId, db = getDb()) {
   return db.collection('event_stats').findOne({ _id: eventId });
 }
 
+/**
+ * "Usan la app de forma recurrente": activos en 3 o más días distintos DENTRO del periodo. activeDays
+ * guarda días de cualquier época ('YYYY-MM-DD', se comparan como texto), así que se filtran al rango.
+ */
+async function recurringUsers(activity, since, sinceDay) {
+  const [row] = await activity
+    .aggregate([
+      { $match: { lastSeen: { $gte: since } } },
+      {
+        $project: {
+          days: { $size: { $filter: { input: { $ifNull: ['$activeDays', []] }, cond: { $gte: ['$$this', sinceDay] } } } },
+        },
+      },
+      { $match: { days: { $gte: 3 } } },
+      { $count: 'n' },
+    ])
+    .toArray();
+  return row?.n ?? 0;
+}
+
 /** RN4: KPIs del piloto para el equipo (admin). */
 export async function adminOverview({ days = 30 } = {}, db = getDb()) {
   const since = new Date(Date.now() - days * 86_400_000);
@@ -84,8 +104,7 @@ export async function adminOverview({ days = 30 } = {}, db = getDb()) {
   const [active7d, active30d, recurring] = await Promise.all([
     activity.countDocuments({ lastSeen: { $gte: weekAgo } }),
     activity.countDocuments({ lastSeen: { $gte: since } }),
-    // "Usan la app de forma recurrente": activos en 3 o más días distintos.
-    activity.countDocuments({ 'activeDays.2': { $exists: true }, lastSeen: { $gte: since } }),
+    recurringUsers(activity, since, sinceDay),
   ]);
 
   const merchants = db.collection('merchant_stats');

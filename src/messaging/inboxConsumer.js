@@ -6,6 +6,7 @@ import { handlers } from './handlers.js';
 
 const QUEUE = `${config.serviceName}.inbox`;
 const RETRY_QUEUE = `${config.serviceName}.inbox.retry`;
+const DUPLICATE_KEY = 11000;
 const MAX_RETRIES = 3;
 
 /**
@@ -71,14 +72,24 @@ async function handle(channel, msg, registry, db = undefined) {
   try {
     const database = db ?? getDb();
     const processed = database.collection('processed_events');
-    if (await processed.findOne({ _id: envelope.eventId })) return channel.ack(msg);
+    // Sin transacciones (Mongo sin réplica), el eventId se reclama ANTES de aplicar los $inc: el _id
+    // único hace que solo una entrega gane, aunque lleguen dos a la vez o se repita tras un reinicio.
+    // Si el proceso muere entre la reclamación y el handler, ese evento se pierde en vez de contarse
+    // dos veces: para métricas es preferible quedarse corto que inflar los KPIs.
+    try {
+      await processed.insertOne({ _id: envelope.eventId, eventType: envelope.eventType, processedAt: new Date() });
+    } catch (claimErr) {
+      if (claimErr?.code === DUPLICATE_KEY) return channel.ack(msg);
+      throw claimErr;
+    }
 
-    await handler(envelope.data, envelope, database);
-    await processed.updateOne(
-      { _id: envelope.eventId },
-      { $setOnInsert: { eventType: envelope.eventType, processedAt: new Date() } },
-      { upsert: true },
-    );
+    try {
+      await handler(envelope.data, envelope, database);
+    } catch (handlerErr) {
+      // Se libera la reclamación para que el reintento sí se procese.
+      await processed.deleteOne({ _id: envelope.eventId }).catch(() => {});
+      throw handlerErr;
+    }
     channel.ack(msg);
   } catch (err) {
     await handleFailure(channel, msg, envelope, err);

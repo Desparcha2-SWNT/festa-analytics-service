@@ -90,6 +90,46 @@ describe.skipIf(!MONGO || !hasContracts)('analytics-service con MongoDB', () => 
     expect(user.status).toBe(403);
   });
 
+  it('dos entregas simultáneas del mismo mensaje cuentan una sola vez', async () => {
+    const { _internal } = await import('../src/messaging/inboxConsumer.js');
+    const registry = {
+      validateEnvelope: () => true,
+      getExpectedProducer: () => null,
+      getExpectedExchange: () => null,
+      getDataValidator: () => null,
+    };
+    const example = consumedExamples().find((e) => e.eventType === 'account.registered');
+    const env = {
+      eventId: '0b0c0d0e-0f10-4a11-8b12-131415161718',
+      eventType: 'account.registered',
+      producer: 'auth-service',
+      occurredAt: '2099-03-03T12:00:00.000Z',
+      data: { ...example.data, userId: '7a7b7c7d-7e7f-4a80-8b81-828384858687', registeredAt: '2099-03-03T12:00:00.000Z' },
+    };
+    const channel = { ack: () => {}, nack: () => {}, sendToQueue: () => {} };
+    const msg = () => ({ content: Buffer.from(JSON.stringify(env)), properties: { headers: {} }, fields: { exchange: 'festa.auth' } });
+    const before = await db.collection('platform_daily').find().toArray();
+    const sum = (rows) => rows.reduce((acc, r) => acc + (r.registrations ?? 0), 0);
+
+    await Promise.all([_internal.handle(channel, msg(), registry, db), _internal.handle(channel, msg(), registry, db)]);
+    await _internal.handle(channel, msg(), registry, db);
+
+    expect(sum(await db.collection('platform_daily').find().toArray())).toBe(sum(before) + 1);
+  });
+
+  it('RN4: un usuario con días activos viejos no cuenta como recurrente en el periodo', async () => {
+    const { adminOverview } = await import('../src/stats/queries.js');
+    const now = new Date();
+    const daysAgo = (n) => new Date(now.getTime() - n * 86_400_000).toISOString().slice(0, 10);
+    const before = (await adminOverview({ days: 30 }, db)).users.recurring;
+    await db.collection('user_activity').insertMany([
+      { _id: 'recurrente-viejo', activeDays: ['2020-01-01', '2020-01-02', '2020-01-03', daysAgo(0)], lastSeen: now },
+      { _id: 'recurrente-real', activeDays: [daysAgo(1), daysAgo(2), daysAgo(3)], lastSeen: now },
+    ]);
+    expect((await adminOverview({ days: 30 }, db)).users.recurring).toBe(before + 1);
+    await db.collection('user_activity').deleteMany({ _id: { $in: ['recurrente-viejo', 'recurrente-real'] } });
+  });
+
   it('account.deleted quita el userId de los agregados', async () => {
     await handlers['account.deleted']({ userId: ORGANIZER, deletedAt: new Date().toISOString() }, { eventType: 'account.deleted' }, db);
     expect(await db.collection('event_stats').countDocuments({ organizerId: ORGANIZER })).toBe(0);
