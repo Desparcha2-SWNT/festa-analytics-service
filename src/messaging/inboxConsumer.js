@@ -8,6 +8,8 @@ const QUEUE = `${config.serviceName}.inbox`;
 const RETRY_QUEUE = `${config.serviceName}.inbox.retry`;
 const DUPLICATE_KEY = 11000;
 const MAX_RETRIES = 3;
+// Tiempo que una entrega conserva la reclamación antes de que otra pueda retomarla (si el proceso murió).
+const LEASE_MS = 60_000;
 
 /**
  * Consume `<servicio>.inbox` siguiendo contracts/README.md § Consumir: valida sobre, productor,
@@ -72,16 +74,16 @@ async function handle(channel, msg, registry, db = undefined) {
   try {
     const database = db ?? getDb();
     const processed = database.collection('processed_events');
-    // Sin transacciones (Mongo sin réplica), el eventId se reclama ANTES de aplicar los $inc: el _id
-    // único hace que solo una entrega gane, aunque lleguen dos a la vez o se repita tras un reinicio.
-    // Si el proceso muere entre la reclamación y el handler, ese evento se pierde en vez de contarse
-    // dos veces: para métricas es preferible quedarse corto que inflar los KPIs.
-    try {
-      await processed.insertOne({ _id: envelope.eventId, eventType: envelope.eventType, processedAt: new Date() });
-    } catch (claimErr) {
-      if (claimErr?.code === DUPLICATE_KEY) return channel.ack(msg);
-      throw claimErr;
-    }
+    // Reclamación con lease. Sin transacciones (Mongo sin réplica) el claim y los $inc no son atómicos:
+    // - Una entrega ya terminada (status 'done') se confirma sin efecto.
+    // - Una entrega con lease vigente la tiene otra en curso: se reencola para revisarla después.
+    // - Un lease vencido (el proceso murió tras reclamar) se retoma: el evento NO se pierde.
+    // Límite conocido: si el proceso muere a mitad de un handler con varias escrituras, el reintento
+    // puede repetir las escrituras que ya se aplicaron. Eliminarlo exige transacciones (replica set).
+    const now = new Date();
+    const claimed = await claimEvent(processed, envelope, now);
+    if (claimed === 'done') return channel.ack(msg);
+    if (claimed === 'busy') return channel.nack(msg, false, true);
 
     try {
       await handler(envelope.data, envelope, database);
@@ -90,10 +92,40 @@ async function handle(channel, msg, registry, db = undefined) {
       await processed.deleteOne({ _id: envelope.eventId }).catch(() => {});
       throw handlerErr;
     }
+    await processed.updateOne({ _id: envelope.eventId }, { $set: { status: 'done', processedAt: new Date() } });
     channel.ack(msg);
   } catch (err) {
     await handleFailure(channel, msg, envelope, err);
   }
+}
+
+/**
+ * Reclama el eventId con un lease. Devuelve 'claimed' (procesar), 'done' (ya procesado) o 'busy'
+ * (otra entrega lo tiene con lease vigente).
+ */
+export async function claimEvent(processed, envelope, now = new Date(), leaseMs = LEASE_MS) {
+  const lease = new Date(now.getTime() + leaseMs);
+  try {
+    await processed.insertOne({
+      _id: envelope.eventId,
+      eventType: envelope.eventType,
+      status: 'processing',
+      leaseUntil: lease,
+      claimedAt: now,
+    });
+    return 'claimed';
+  } catch (claimErr) {
+    if (claimErr?.code !== DUPLICATE_KEY) throw claimErr;
+  }
+
+  const existing = await processed.findOne({ _id: envelope.eventId });
+  if (existing?.status === 'done') return 'done';
+  // Lease vencido: se toma atómicamente (solo una entrega gana la toma).
+  const taken = await processed.findOneAndUpdate(
+    { _id: envelope.eventId, status: 'processing', leaseUntil: { $lte: now } },
+    { $set: { leaseUntil: lease, claimedAt: now } },
+  );
+  return taken ? 'claimed' : 'busy';
 }
 
 async function handleFailure(channel, msg, envelope, err) {

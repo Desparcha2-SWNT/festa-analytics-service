@@ -21,13 +21,34 @@ const msgWith = (envelope, exchange = 'festa.auth', headers = {}) => ({
   properties: { headers },
   fields: { exchange },
 });
-function fakeDb(alreadyProcessed = false) {
+// Fake con estado de la colección processed_events (claim con lease, done, toma de lease vencido).
+function fakeDb({ existing = null } = {}) {
+  const store = { doc: existing ? { ...existing } : null };
   const duplicate = () => Promise.reject(Object.assign(new Error('E11000 duplicate key'), { code: 11000 }));
   const processed = {
-    insertOne: vi.fn(alreadyProcessed ? duplicate : () => Promise.resolve()),
-    deleteOne: vi.fn().mockResolvedValue({ deletedCount: 1 }),
+    insertOne: vi.fn((doc) => {
+      if (store.doc) return duplicate();
+      store.doc = { ...doc };
+      return Promise.resolve({ acknowledged: true });
+    }),
+    findOne: vi.fn(async () => store.doc),
+    findOneAndUpdate: vi.fn(async (filter, update) => {
+      const d = store.doc;
+      const ok = d && d._id === filter._id && d.status === filter.status && d.leaseUntil <= filter.leaseUntil.$lte;
+      if (!ok) return null;
+      Object.assign(d, update.$set);
+      return { ...d };
+    }),
+    updateOne: vi.fn(async (filter, update) => {
+      if (store.doc && store.doc._id === filter._id) Object.assign(store.doc, update.$set);
+      return { acknowledged: true };
+    }),
+    deleteOne: vi.fn(async () => {
+      store.doc = null;
+      return { deletedCount: 1 };
+    }),
   };
-  return { collection: vi.fn(() => processed), processed };
+  return { collection: vi.fn(() => processed), processed, store };
 }
 const envelope = { eventId: 'e1', eventType: 'account.registered', producer: 'auth-service', data: { userId: 'u' } };
 
@@ -83,13 +104,44 @@ describe('handle', () => {
     expect(db.processed.deleteOne).toHaveBeenCalledWith({ _id: 'e1' });
   });
 
-  it('un duplicado se confirma sin repetir el efecto', async () => {
+  it('un duplicado ya terminado se confirma sin repetir el efecto', async () => {
     h.handler.mockReset();
     const channel = fakeChannel();
     const msg = msgWith(envelope);
-    await _internal.handle(channel, msg, fakeRegistry(), fakeDb(true));
+    const db = fakeDb({ existing: { _id: 'e1', status: 'done' } });
+    await _internal.handle(channel, msg, fakeRegistry(), db);
     expect(h.handler).not.toHaveBeenCalled();
     expect(channel.ack).toHaveBeenCalledWith(msg);
+  });
+
+  it('si otra entrega tiene el lease vigente, reencola sin ejecutar el handler', async () => {
+    h.handler.mockReset();
+    const channel = fakeChannel();
+    const msg = msgWith(envelope);
+    const future = new Date(Date.now() + 30_000);
+    const db = fakeDb({ existing: { _id: 'e1', status: 'processing', leaseUntil: future } });
+    await _internal.handle(channel, msg, fakeRegistry(), db);
+    expect(h.handler).not.toHaveBeenCalled();
+    expect(channel.nack).toHaveBeenCalledWith(msg, false, true);
+  });
+
+  it('si el proceso murió tras reclamar (lease vencido), el reintento retoma el evento y no lo pierde', async () => {
+    h.handler.mockReset().mockResolvedValue();
+    const channel = fakeChannel();
+    const msg = msgWith(envelope);
+    const past = new Date(Date.now() - 1000);
+    const db = fakeDb({ existing: { _id: 'e1', status: 'processing', leaseUntil: past } });
+    await _internal.handle(channel, msg, fakeRegistry(), db);
+    expect(h.handler).toHaveBeenCalledTimes(1);
+    expect(db.store.doc.status).toBe('done');
+    expect(channel.ack).toHaveBeenCalledWith(msg);
+  });
+
+  it('al terminar el handler marca el evento como done', async () => {
+    h.handler.mockReset().mockResolvedValue();
+    const db = fakeDb();
+    await _internal.handle(fakeChannel(), msgWith(envelope), fakeRegistry(), db);
+    expect(db.store.doc.status).toBe('done');
   });
 
   it('una falla transitoria se reintenta por inbox.retry', async () => {
