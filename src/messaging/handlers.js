@@ -54,8 +54,8 @@ async function eventSnapshot(d, e, db) {
 export const handlers = {
   // ---------------------------------------------------------------- cuentas
   'account.registered': async (d, e, db) => {
-    await incDaily(db, day(d.registeredAt), { registrations: 1, [`registrationsBy.${d.provider}`]: 1, [`roles.${d.role}`]: 1 });
     await touchUser(db, d.userId, d.registeredAt);
+    await incDaily(db, day(d.registeredAt), { registrations: 1, [`registrationsBy.${d.provider}`]: 1, [`roles.${d.role}`]: 1 });
   },
 
   // Ley 1581: se elimina el userId de los agregados.
@@ -105,30 +105,32 @@ export const handlers = {
   'event.cancelled': (d, e, db) => incEvent(db, d.eventId, {}, { status: 'cancelled', cancelledAt: new Date(d.cancelledAt) }),
   'event.sold_out': (d, e, db) => incEvent(db, d.eventId, {}, { soldOutAt: new Date(d.soldOutAt) }),
   'event.expired': (d, e, db) => incEvent(db, d.eventId, {}, { status: 'expired', expiredAt: new Date(d.expiredAt) }),
+  // Orden: primero lo idempotente (touchUser), al final el único $inc. Si falla algo a mitad, el
+  // reintento repite touchUser sin efecto extra y el incremento se aplica una sola vez.
   'engagement.viewed': async (d, e, db) => {
-    await incEvent(db, d.eventId, { 'views.total': 1, [`views.${d.source}`]: 1 });
     await touchUser(db, d.viewerId, d.viewedAt);
+    await incEvent(db, d.eventId, { 'views.total': 1, [`views.${d.source}`]: 1 });
   },
   'engagement.shared': async (d, e, db) => {
-    await incEvent(db, d.eventId, { shares: 1 });
     await touchUser(db, d.sharedBy, d.sharedAt);
+    await incEvent(db, d.eventId, { shares: 1 });
   },
 
   // ---------------------------------------------------------------- asistencia
   // attendeeCount trae el total vigente; se guarda tal cual (no se suma) y además se cuentan las altas.
   'attendance.confirmed': async (d, e, db) => {
+    await touchUser(db, d.userId, d.confirmedAt);
     await incEvent(
       db,
       d.eventId,
       { [d.source === 'ticket' ? 'confirmations.ticket' : 'confirmations.rsvp']: 1 },
       { attendeeCount: d.attendeeCount },
     );
-    await touchUser(db, d.userId, d.confirmedAt);
   },
   'attendance.cancelled': (d, e, db) => incEvent(db, d.eventId, { cancellations: 1, [`cancellationReasons.${d.reason}`]: 1 }, { attendeeCount: d.attendeeCount }),
   'pass.checked_in': async (d, e, db) => {
-    await incEvent(db, d.eventId, { checkIns: 1 });
     await touchUser(db, d.userId, d.checkedInAt);
+    await incEvent(db, d.eventId, { checkIns: 1 });
   },
   'pass.check_in_rejected': (d, e, db) => incEvent(db, d.eventId, { 'checkInRejected.total': 1, [`checkInRejected.${d.reason}`]: 1 }),
 
