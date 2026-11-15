@@ -40,12 +40,16 @@ function fakeDb({ existing = null } = {}) {
       return { ...d };
     }),
     updateOne: vi.fn(async (filter, update) => {
-      if (store.doc && store.doc._id === filter._id) Object.assign(store.doc, update.$set);
-      return { acknowledged: true };
+      const d = store.doc;
+      const matched = Boolean(d && d._id === filter._id && (filter.claimToken === undefined || d.claimToken === filter.claimToken));
+      if (matched) Object.assign(d, update.$set);
+      return { acknowledged: true, matchedCount: matched ? 1 : 0 };
     }),
-    deleteOne: vi.fn(async () => {
-      store.doc = null;
-      return { deletedCount: 1 };
+    deleteOne: vi.fn(async (filter) => {
+      const d = store.doc;
+      const matched = Boolean(d && d._id === filter._id && (filter.claimToken === undefined || d.claimToken === filter.claimToken));
+      if (matched) store.doc = null;
+      return { deletedCount: matched ? 1 : 0 };
     }),
   };
   return { collection: vi.fn(() => processed), processed, store };
@@ -101,7 +105,34 @@ describe('handle', () => {
     channel.sendToQueue.mockImplementation((q, c, o, cb) => cb(null));
     const db = fakeDb();
     await _internal.handle(channel, msgWith(envelope), fakeRegistry(), db);
-    expect(db.processed.deleteOne).toHaveBeenCalledWith({ _id: 'e1' });
+    expect(db.processed.deleteOne).toHaveBeenCalledWith(expect.objectContaining({ _id: 'e1', claimToken: expect.any(String) }));
+    expect(db.store.doc).toBeNull();
+  });
+
+  it('si otra entrega retomó el lease durante el handler, no borra su reclamación al fallar', async () => {
+    h.handler.mockReset().mockImplementation(async () => {
+      // Simula: el lease venció y otra entrega lo tomó mientras esta seguía trabajando.
+      db.store.doc.claimToken = 'otra-entrega';
+      throw new Error('falla tardía');
+    });
+    const channel = fakeChannel();
+    channel.sendToQueue.mockImplementation((q, c, o, cb) => cb(null));
+    const db = fakeDb();
+    await _internal.handle(channel, msgWith(envelope), fakeRegistry(), db);
+    expect(db.store.doc).not.toBeNull();
+    expect(db.store.doc.claimToken).toBe('otra-entrega');
+  });
+
+  it('si el lease se perdió antes de terminar, no marca como done la reclamación ajena', async () => {
+    h.handler.mockReset().mockImplementation(async () => {
+      db.store.doc.claimToken = 'otra-entrega';
+    });
+    const channel = fakeChannel();
+    const msg = msgWith(envelope);
+    const db = fakeDb();
+    await _internal.handle(channel, msg, fakeRegistry(), db);
+    expect(db.store.doc.status).toBe('processing');
+    expect(channel.ack).toHaveBeenCalledWith(msg);
   });
 
   it('un duplicado ya terminado se confirma sin repetir el efecto', async () => {

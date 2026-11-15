@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { getDb } from '../db/mongo.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
@@ -81,18 +82,25 @@ async function handle(channel, msg, registry, db = undefined) {
     // Límite conocido: si el proceso muere a mitad de un handler con varias escrituras, el reintento
     // puede repetir las escrituras que ya se aplicaron. Eliminarlo exige transacciones (replica set).
     const now = new Date();
-    const claimed = await claimEvent(processed, envelope, now);
-    if (claimed === 'done') return channel.ack(msg);
-    if (claimed === 'busy') return channel.nack(msg, false, true);
+    const claim = await claimEvent(processed, envelope, now);
+    if (claim.state === 'done') return channel.ack(msg);
+    if (claim.state === 'busy') return channel.nack(msg, false, true);
 
     try {
       await handler(envelope.data, envelope, database);
     } catch (handlerErr) {
-      // Se libera la reclamación para que el reintento sí se procese.
-      await processed.deleteOne({ _id: envelope.eventId }).catch(() => {});
+      // Se libera SOLO nuestra reclamación; si ya nos la quitó otra entrega, no se toca la suya.
+      await processed.deleteOne({ _id: envelope.eventId, claimToken: claim.token }).catch(() => {});
       throw handlerErr;
     }
-    await processed.updateOne({ _id: envelope.eventId }, { $set: { status: 'done', processedAt: new Date() } });
+    const finished = await processed.updateOne(
+      { _id: envelope.eventId, claimToken: claim.token },
+      { $set: { status: 'done', processedAt: new Date() } },
+    );
+    if (finished.matchedCount === 0) {
+      // Nuestro lease venció y otra entrega lo retomó: el efecto ya se aplicó, así que es el caso de duplicado conocido.
+      logger.warn({ eventId: envelope.eventId }, 'el lease venció durante el handler; otra entrega pudo retomar el evento');
+    }
     channel.ack(msg);
   } catch (err) {
     await handleFailure(channel, msg, envelope, err);
@@ -100,32 +108,36 @@ async function handle(channel, msg, registry, db = undefined) {
 }
 
 /**
- * Reclama el eventId con un lease. Devuelve 'claimed' (procesar), 'done' (ya procesado) o 'busy'
- * (otra entrega lo tiene con lease vigente).
+ * Reclama el eventId con un lease y una identidad propia (claimToken). Devuelve
+ * { state: 'claimed', token } (procesar), { state: 'done' } (ya procesado) o { state: 'busy' }
+ * (otra entrega lo tiene con lease vigente). Liberar y finalizar exigen el mismo token, así una
+ * entrega cuyo lease venció no puede borrar la reclamación de quien la retomó.
  */
 export async function claimEvent(processed, envelope, now = new Date(), leaseMs = LEASE_MS) {
   const lease = new Date(now.getTime() + leaseMs);
+  const token = randomUUID();
   try {
     await processed.insertOne({
       _id: envelope.eventId,
       eventType: envelope.eventType,
       status: 'processing',
       leaseUntil: lease,
+      claimToken: token,
       claimedAt: now,
     });
-    return 'claimed';
+    return { state: 'claimed', token };
   } catch (claimErr) {
     if (claimErr?.code !== DUPLICATE_KEY) throw claimErr;
   }
 
   const existing = await processed.findOne({ _id: envelope.eventId });
-  if (existing?.status === 'done') return 'done';
-  // Lease vencido: se toma atómicamente (solo una entrega gana la toma).
+  if (existing?.status === 'done') return { state: 'done' };
+  // Lease vencido: se toma atómicamente con un token nuevo (solo una entrega gana la toma).
   const taken = await processed.findOneAndUpdate(
     { _id: envelope.eventId, status: 'processing', leaseUntil: { $lte: now } },
-    { $set: { leaseUntil: lease, claimedAt: now } },
+    { $set: { leaseUntil: lease, claimedAt: now, claimToken: token } },
   );
-  return taken ? 'claimed' : 'busy';
+  return taken ? { state: 'claimed', token } : { state: 'busy' };
 }
 
 async function handleFailure(channel, msg, envelope, err) {
