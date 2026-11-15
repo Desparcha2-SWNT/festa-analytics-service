@@ -87,7 +87,8 @@ async function handle(channel, msg, registry, db = undefined) {
     if (claim.state === 'busy') return channel.nack(msg, false, true);
 
     try {
-      await handler(envelope.data, envelope, database);
+      // Los efectos llevan el id del mensaje (ver applyOnce en handlers.js) para no repetirse en un reintento.
+      await handler(envelope.data, envelope, { collection: (name) => database.collection(name), effectId: envelope.eventId });
     } catch (handlerErr) {
       // Se libera SOLO nuestra reclamación; si ya nos la quitó otra entrega, no se toca la suya.
       await processed.deleteOne({ _id: envelope.eventId, claimToken: claim.token }).catch(() => {});

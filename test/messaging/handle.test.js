@@ -94,7 +94,7 @@ describe('handle', () => {
     await _internal.handle(channel, msg, fakeRegistry(), db);
     expect(db.processed.insertOne).toHaveBeenCalledWith(expect.objectContaining({ _id: 'e1' }));
     expect(db.processed.insertOne.mock.invocationCallOrder[0]).toBeLessThan(h.handler.mock.invocationCallOrder[0]);
-    expect(h.handler).toHaveBeenCalledWith(envelope.data, envelope, db);
+    expect(h.handler).toHaveBeenCalledWith(envelope.data, envelope, expect.objectContaining({ effectId: 'e1' }));
     expect(db.processed.deleteOne).not.toHaveBeenCalled();
     expect(channel.ack).toHaveBeenCalledWith(msg);
   });

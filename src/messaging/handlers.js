@@ -3,14 +3,42 @@
 
 const day = (iso) => new Date(iso ?? Date.now()).toISOString().slice(0, 10);
 
-const incEvent = (db, eventId, inc, set = {}) =>
-  db.collection('event_stats').updateOne(
-    { _id: eventId },
-    { $inc: inc, $set: { ...set, updatedAt: new Date() } },
-    { upsert: true },
-  );
+// Cuántos ids de mensajes recientes se guardan por documento para detectar reintentos.
+const RECENT_EFFECTS = 500;
 
-const incDaily = (db, date, inc) => db.collection('platform_daily').updateOne({ _id: date }, { $inc: inc }, { upsert: true });
+/**
+ * Aplica $inc/$set a UN documento sin transacciones, de forma idempotente por mensaje: el id del
+ * mensaje (db.effectId) se guarda en el mismo documento con $push, en la misma escritura atómica
+ * que el incremento. Si el mensaje ya está en `recentEffects`, el filtro no coincide y no se suma
+ * otra vez. Así un reintento tras una caída a mitad del handler no duplica contadores, y cada
+ * documento se corrige por separado. Límite: un reintento de un mensaje que ya salió de la
+ * ventana de RECENT_EFFECTS para ese documento se contaría dos veces.
+ */
+async function applyOnce(db, collection, id, inc, set = {}) {
+  const col = db.collection(collection);
+  const now = new Date();
+  const effectId = db.effectId;
+  if (!effectId) {
+    return col.updateOne({ _id: id }, { $inc: inc, $set: { ...set, updatedAt: now } }, { upsert: true });
+  }
+  try {
+    await col.updateOne({ _id: id }, { $setOnInsert: { recentEffects: [] } }, { upsert: true });
+  } catch (err) {
+    if (err?.code !== 11000) throw err; // otra entrega creó el documento a la vez
+  }
+  return col.updateOne(
+    { _id: id, recentEffects: { $ne: effectId } },
+    {
+      $inc: inc,
+      $set: { ...set, updatedAt: now },
+      $push: { recentEffects: { $each: [effectId], $slice: -RECENT_EFFECTS } },
+    },
+  );
+}
+
+const incEvent = (db, eventId, inc, set = {}) => applyOnce(db, 'event_stats', eventId, inc, set);
+
+const incDaily = (db, date, inc) => applyOnce(db, 'platform_daily', date, inc);
 
 /** RN4: actividad por usuario y día (usuarios recurrentes vs. que solo descargan). */
 const touchUser = (db, userId, iso) =>
@@ -154,21 +182,13 @@ export const handlers = {
     await incDaily(db, day(d.refundedAt), { refundedCents: d.amountCents });
   },
   'payout.recorded': async (d, e, db) => {
-    await db.collection('merchant_stats').updateOne(
-      { _id: d.organizerId },
-      { $inc: { payoutsCents: d.amountCents, payoutCount: 1 }, $set: { merchantId: d.merchantId, lastPayoutAt: new Date(d.paidAt) } },
-      { upsert: true },
-    );
+    await applyOnce(db, 'merchant_stats', d.organizerId, { payoutsCents: d.amountCents, payoutCount: 1 }, { merchantId: d.merchantId, lastPayoutAt: new Date(d.paidAt) });
   },
 
   // ---------------------------------------------------------------- IA y push
   'description.generated': async (d, e, db) => {
     await incDaily(db, day(d.generatedAt), { aiDescriptions: 1, aiInputTokens: d.inputTokens, aiOutputTokens: d.outputTokens });
-    await db.collection('merchant_stats').updateOne(
-      { _id: d.requestedBy },
-      { $inc: { aiDescriptions: 1, aiTokens: d.inputTokens + d.outputTokens } },
-      { upsert: true },
-    );
+    await applyOnce(db, 'merchant_stats', d.requestedBy, { aiDescriptions: 1, aiTokens: d.inputTokens + d.outputTokens });
   },
   'recommendation.served': async (d, e, db) => {
     await incDaily(db, day(d.servedAt), { aiRecommendations: 1, aiInputTokens: d.inputTokens, aiOutputTokens: d.outputTokens });
