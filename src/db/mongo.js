@@ -2,6 +2,8 @@ import { MongoClient } from 'mongodb';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 
+const PROCESSED_TTL_S = 30 * 24 * 3600;
+
 let client;
 let db;
 
@@ -13,7 +15,13 @@ export async function connectMongo({ ensureIndexes } = {}) {
   db = client.db();
   await db.collection('outbox').createIndex({ sentAt: 1, createdAt: 1 });
   // Los ids procesados se guardan 30 días: suficiente para cubrir reintentos y reinyecciones de la DLQ.
-  await db.collection('processed_events').createIndex({ processedAt: 1 }, { expireAfterSeconds: 30 * 24 * 3600 });
+  await db.collection('processed_events').createIndex({ processedAt: 1 }, { expireAfterSeconds: PROCESSED_TTL_S });
+  // Una reclamación que se quedó en 'processing' (sin processedAt) también vence a los 30 días de
+  // reclamada: si no, se acumularía para siempre. Para entonces el lease venció hace mucho.
+  await db.collection('processed_events').createIndex(
+    { claimedAt: 1 },
+    { name: 'stuck_claims_ttl', expireAfterSeconds: PROCESSED_TTL_S, partialFilterExpression: { status: 'processing' } },
+  );
   if (ensureIndexes) await ensureIndexes(db);
   logger.info('conectado a MongoDB');
   return db;

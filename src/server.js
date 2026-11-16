@@ -20,12 +20,19 @@ async function main() {
     logger.info({ port: config.port }, 'festa-analytics-service arriba');
   });
 
+  let stopping = false;
   const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
     logger.info('apagando...');
-    server.close();
+    // Red de seguridad: si algo deja el event loop vivo, se sale igual a los 10 s (ECS mata a los 30 s).
+    setTimeout(() => process.exit(0), 10_000).unref();
+    // server.close no devuelve promesa: se espera a que terminen las peticiones abiertas antes de
+    // cerrar el consumidor y Mongo. Luego el proceso sale solo (sin process.exit), así los logs se vacían.
+    await new Promise((resolve) => server.close(resolve));
     await messaging.stop();
     await closeMongo();
-    process.exit(0);
+    logger.info('apagado');
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);

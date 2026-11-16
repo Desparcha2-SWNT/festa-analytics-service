@@ -17,9 +17,10 @@ const LEASE_MS = 60_000;
  * exchange y `data`; es idempotente (colección processed_events); reintenta errores transitorios
  * vía inbox.retry y manda a la DLQ los permanentes.
  *
- * Mongo sin réplica no tiene transacciones: los handlers son idempotentes por diseño (upserts,
- * $addToSet, ids deterministas en el outbox) y el eventId se marca como procesado DESPUÉS del
- * efecto. Si el proceso muere entre ambos, el reintento repite un efecto idempotente.
+ * Mongo sin réplica no tiene transacciones: el eventId se reclama con un lease antes del handler
+ * (claimEvent) y se marca `done` después; los efectos son idempotentes por mensaje (upserts,
+ * $addToSet y applyOnce en handlers.js). Si el proceso muere entre ambos, el lease vence, otra
+ * entrega retoma el evento y repite solo los efectos que faltaron.
  */
 export async function startInboxConsumer(connection) {
   const registry = getSchemaRegistry(config.contractsDir);
@@ -134,9 +135,12 @@ export async function claimEvent(processed, envelope, now = new Date(), leaseMs 
   const existing = await processed.findOne({ _id: envelope.eventId });
   if (existing?.status === 'done') return { state: 'done' };
   // Lease vencido: se toma atómicamente con un token nuevo (solo una entrega gana la toma).
+  // Driver 6.x: findOneAndUpdate devuelve el documento o null (includeResultMetadata: false, explícito
+  // para que un cambio de versión del driver no convierta esto en un objeto siempre verdadero).
   const taken = await processed.findOneAndUpdate(
     { _id: envelope.eventId, status: 'processing', leaseUntil: { $lte: now } },
     { $set: { leaseUntil: lease, claimedAt: now, claimToken: token } },
+    { includeResultMetadata: false },
   );
   return taken ? { state: 'claimed', token } : { state: 'busy' };
 }

@@ -24,7 +24,7 @@ export function startOutboxPublisher(connection, { intervalMs = 2000 } = {}) {
         const row = await outbox.findOneAndUpdate(
           { sentAt: null, $or: [{ lockedUntil: { $exists: false } }, { lockedUntil: { $lt: now } }] },
           { $set: { lockedUntil: new Date(now.getTime() + LEASE_MS) } },
-          { sort: { createdAt: 1 }, returnDocument: 'after' },
+          { sort: { createdAt: 1 }, returnDocument: 'after', includeResultMetadata: false },
         );
         if (!row) break;
 

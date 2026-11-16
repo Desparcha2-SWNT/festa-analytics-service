@@ -119,7 +119,7 @@ export const handlers = {
     const report = await db.collection('reports').findOneAndUpdate(
       { _id: d.reportId },
       { $set: { resolvedAt: new Date(d.resolvedAt), outcome: d.outcome } },
-      { upsert: true, returnDocument: 'before' },
+      { upsert: true, returnDocument: 'before', includeResultMetadata: false },
     );
     const inc = { reportsResolved: 1, [`reportOutcomes.${d.outcome}`]: 1 };
     if (report?.createdAt) inc.reportResolutionMs = new Date(d.resolvedAt) - report.createdAt;
