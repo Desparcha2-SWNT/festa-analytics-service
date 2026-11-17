@@ -3,16 +3,21 @@
 
 const day = (iso) => new Date(iso ?? Date.now()).toISOString().slice(0, 10);
 
-// Cuántos ids de mensajes recientes se guardan por documento para detectar reintentos.
-const RECENT_EFFECTS = 500;
+// Ledger durable de efectos ya aplicados: mismo TTL que processed_events (30 días, ver db/mongo.js).
+export const APPLIED_EFFECTS = 'applied_effects';
 
 /**
- * Aplica $inc/$set a UN documento sin transacciones, de forma idempotente por mensaje: el id del
- * mensaje (db.effectId) se guarda en el mismo documento con $push, en la misma escritura atómica
- * que el incremento. Si el mensaje ya está en `recentEffects`, el filtro no coincide y no se suma
- * otra vez. Así un reintento tras una caída a mitad del handler no duplica contadores, y cada
- * documento se corrige por separado. Límite: un reintento de un mensaje que ya salió de la
- * ventana de RECENT_EFFECTS para ese documento se contaría dos veces.
+ * Aplica $inc/$set a UN documento sin transacciones, exactamente una vez por (mensaje, documento).
+ *
+ * 1. Si el ledger `applied_effects` ya tiene (colección, documento, mensaje), el efecto está aplicado.
+ * 2. Si no, el incremento y el id del mensaje en `pendingEffects` van en la MISMA escritura atómica,
+ *    con un filtro que excluye el id: un reintento tras una caída aquí no vuelve a sumar.
+ * 3. Se registra en el ledger y 4. se saca el id de `pendingEffects`.
+ *
+ * El arreglo solo guarda efectos en curso (entre 2 y 4), no los últimos N: no hay ventana que se
+ * llene y deje pasar un reintento tardío. Ese era el límite de la versión anterior (500 ids por documento).
+ * Una caída en cualquier punto se corrige al reintentar: 2 no se repite porque el id sigue en el
+ * arreglo, y 3 y 4 son idempotentes.
  */
 async function applyOnce(db, collection, id, inc, set = {}) {
   const col = db.collection(collection);
@@ -21,19 +26,22 @@ async function applyOnce(db, collection, id, inc, set = {}) {
   if (!effectId) {
     return col.updateOne({ _id: id }, { $inc: inc, $set: { ...set, updatedAt: now } }, { upsert: true });
   }
-  try {
-    await col.updateOne({ _id: id }, { $setOnInsert: { recentEffects: [] } }, { upsert: true });
-  } catch (err) {
-    if (err?.code !== 11000) throw err; // otra entrega creó el documento a la vez
+  const ledger = db.collection(APPLIED_EFFECTS);
+  const key = `${collection}:${id}:${effectId}`;
+  if (!(await ledger.findOne({ _id: key }))) {
+    try {
+      await col.updateOne({ _id: id }, { $setOnInsert: { pendingEffects: [] } }, { upsert: true });
+    } catch (err) {
+      if (err?.code !== 11000) throw err; // otra entrega creó el documento a la vez
+    }
+    await col.updateOne(
+      { _id: id, pendingEffects: { $ne: effectId } },
+      { $inc: inc, $set: { ...set, updatedAt: now }, $push: { pendingEffects: effectId } },
+    );
+    await ledger.updateOne({ _id: key }, { $setOnInsert: { appliedAt: now } }, { upsert: true });
   }
-  return col.updateOne(
-    { _id: id, recentEffects: { $ne: effectId } },
-    {
-      $inc: inc,
-      $set: { ...set, updatedAt: now },
-      $push: { recentEffects: { $each: [effectId], $slice: -RECENT_EFFECTS } },
-    },
-  );
+  // También cuando el ledger ya existía: una caída entre 3 y 4 dejó el id en el arreglo.
+  return col.updateOne({ _id: id }, { $pull: { pendingEffects: effectId } });
 }
 
 const incEvent = (db, eventId, inc, set = {}) => applyOnce(db, 'event_stats', eventId, inc, set);

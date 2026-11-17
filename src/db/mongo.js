@@ -22,6 +22,9 @@ export async function connectMongo({ ensureIndexes } = {}) {
     { claimedAt: 1 },
     { name: 'stuck_claims_ttl', expireAfterSeconds: PROCESSED_TTL_S, partialFilterExpression: { status: 'processing' } },
   );
+  // Ledger de efectos aplicados por (documento, mensaje) (ver applyOnce en messaging/handlers.js):
+  // cubre la misma ventana de 30 días que processed_events.
+  await db.collection('applied_effects').createIndex({ appliedAt: 1 }, { expireAfterSeconds: PROCESSED_TTL_S });
   if (ensureIndexes) await ensureIndexes(db);
   logger.info('conectado a MongoDB');
   return db;

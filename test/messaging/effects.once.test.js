@@ -1,4 +1,5 @@
-// Un mensaje entregado dos veces (reintento tras caída a mitad del handler) no debe sumar dos veces.
+// Un mensaje entregado dos veces (reintento tras caída a mitad del handler) no debe sumar dos veces,
+// aunque entre la caída y el reintento lleguen muchos mensajes al mismo documento.
 import { describe, expect, it } from 'vitest';
 import { handlers } from '../../src/messaging/handlers.js';
 
@@ -18,7 +19,11 @@ function memoryDb() {
     const docs = cols.get(name);
     return {
       docs,
+      async findOne(filter) {
+        return docs.get(filter._id) ?? null;
+      },
       async updateOne(filter, update, opts = {}) {
+        if (db.failNext?.(name, update)) throw new Error(`caída simulada en ${name}`);
         let doc = docs.get(filter._id);
         const matches = (d) =>
           d &&
@@ -39,9 +44,10 @@ function memoryDb() {
         for (const [k, v] of Object.entries(update.$inc ?? {})) setPath(doc, k, (getPath(doc, k) ?? 0) + v);
         for (const [k, v] of Object.entries(update.$set ?? {})) setPath(doc, k, v);
         for (const [k, v] of Object.entries(update.$push ?? {})) {
-          const arr = [...(doc[k] ?? []), ...v.$each];
-          doc[k] = v.$slice < 0 ? arr.slice(v.$slice) : arr;
+          const arr = [...(doc[k] ?? []), ...(v?.$each ?? [v])];
+          doc[k] = v?.$slice < 0 ? arr.slice(v.$slice) : arr;
         }
+        for (const [k, v] of Object.entries(update.$pull ?? {})) doc[k] = (doc[k] ?? []).filter((x) => x !== v);
         for (const [k, v] of Object.entries(update.$addToSet ?? {})) {
           const arr = doc[k] ?? [];
           if (!arr.includes(v)) arr.push(v);
@@ -53,10 +59,25 @@ function memoryDb() {
       },
     };
   };
-  return { collection };
+  const db = { collection, failNext: null };
+  return db;
+}
+
+/** Hace fallar UNA vez la escritura que cumpla `predicate(colección, update)`: simula una caída ahí. */
+function crashOnce(db, predicate) {
+  let armed = true;
+  db.failNext = (name, update) => {
+    if (armed && predicate(name, update)) {
+      armed = false;
+      return true;
+    }
+    return false;
+  };
 }
 
 const scoped = (db, effectId) => ({ collection: db.collection, effectId });
+const VIEW = { eventId: 'e1', viewerId: 'u1', source: 'map', viewedAt: '2026-11-15T12:00:00Z' };
+const views = (db) => db.collection('event_stats').docs.get('e1').views.total;
 
 describe('efectos idempotentes por mensaje', () => {
   it('engagement.viewed entregado dos veces suma views.total una sola vez', async () => {
@@ -88,11 +109,40 @@ describe('efectos idempotentes por mensaje', () => {
   it('un reintento corrige solo el documento que faltó (dos documentos en un handler)', async () => {
     const db = memoryDb();
     const data = { eventId: 'e1', orderId: 'o1', buyerId: 'u1', quantity: 2, subtotalCents: 100, commissionCents: 8, paymentMethod: 'CARD', approvedAt: '2026-11-15T12:00:00Z' };
-    // Simula que la primera entrega aplicó event_stats y murió antes de platform_daily.
-    await handlers['order.approved'](data, {}, scoped(db, 'msg-7'));
-    db.collection('platform_daily').docs.clear(); // el documento diario se perdió
+    // La primera entrega aplicó event_stats y murió al escribir platform_daily.
+    crashOnce(db, (name, update) => name === 'platform_daily' && update.$inc);
+    await expect(handlers['order.approved'](data, {}, scoped(db, 'msg-7'))).rejects.toThrow('caída simulada');
+    expect(db.collection('platform_daily').docs.get('2026-11-15')?.ticketsSold).toBeUndefined();
     await handlers['order.approved'](data, {}, scoped(db, 'msg-7'));
     expect(db.collection('event_stats').docs.get('e1').ticketsSold).toBe(2);
     expect(db.collection('platform_daily').docs.size).toBe(1);
+  });
+
+  it('un reintento después de más de 500 mensajes al mismo documento no vuelve a sumar', async () => {
+    const db = memoryDb();
+    // Caída después del incremento y antes de registrarlo en el ledger.
+    crashOnce(db, (name) => name === 'applied_effects');
+    await expect(handlers['engagement.viewed'](VIEW, {}, scoped(db, 'msg-late'))).rejects.toThrow('caída simulada');
+    for (let i = 0; i < 600; i += 1) await handlers['engagement.viewed'](VIEW, {}, scoped(db, `msg-${i}`));
+    await handlers['engagement.viewed'](VIEW, {}, scoped(db, 'msg-late')); // el reintento llega tarde
+    expect(views(db)).toBe(601);
+  });
+
+  it('un mensaje ya aplicado no vuelve a sumar aunque pasen más de 500 mensajes', async () => {
+    const db = memoryDb();
+    await handlers['engagement.viewed'](VIEW, {}, scoped(db, 'msg-old'));
+    for (let i = 0; i < 600; i += 1) await handlers['engagement.viewed'](VIEW, {}, scoped(db, `msg-${i}`));
+    await handlers['engagement.viewed'](VIEW, {}, scoped(db, 'msg-old'));
+    expect(views(db)).toBe(601);
+  });
+
+  it('una caída entre el ledger y la limpieza no deja ids en el documento', async () => {
+    const db = memoryDb();
+    crashOnce(db, (name, update) => name === 'event_stats' && update.$pull);
+    await expect(handlers['engagement.viewed'](VIEW, {}, scoped(db, 'msg-1'))).rejects.toThrow('caída simulada');
+    await handlers['engagement.viewed'](VIEW, {}, scoped(db, 'msg-1'));
+    const doc = db.collection('event_stats').docs.get('e1');
+    expect(doc.views.total).toBe(1);
+    expect(doc.pendingEffects).toEqual([]);
   });
 });

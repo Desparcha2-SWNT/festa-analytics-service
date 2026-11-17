@@ -17,6 +17,9 @@ No llama a ningún servicio: construye sus agregados consumiendo los 28 eventos 
 
 `account.deleted` (Ley 1581) elimina al usuario de `user_activity` y `merchant_stats` y quita su id de `event_stats`.
 
+Los contadores son exactos ante reintentos sin transacciones: cada incremento se registra por (documento, mensaje) en
+`applied_effects` (TTL de 30 días, igual que `processed_events`); ver `applyOnce` en `src/messaging/handlers.js`.
+
 ## API
 
 Todas con JWT. El cliente las llama con el prefijo `/api`.
