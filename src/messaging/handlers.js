@@ -74,6 +74,11 @@ async function eventSnapshot(d, e, db) {
     // No existe todavía, o existe con una versión >= (mensaje viejo): se inserta solo si no existe.
     await db.collection('event_stats').updateOne({ _id: d.eventId }, { $setOnInsert: { ...meta, createdAt: new Date() } }, { upsert: true });
   }
+  // Si el organizador ya se borró (lápida de account.deleted), el snapshot que llegó tarde no debe dejar su id.
+  // Se comprueba después de escribir: cubre tanto el orden snapshot→borrado como borrado→snapshot.
+  if (d.organizerId && (await db.collection('deleted_accounts').findOne({ _id: d.organizerId }))) {
+    await db.collection('event_stats').updateOne({ _id: d.eventId }, { $set: { organizerId: null } });
+  }
   if (e.eventType === 'event.published') {
     await incDaily(db, day(d.updatedAt), { eventsPublished: 1, ...(d.isLive ? { liveEventsPublished: 1 } : {}) });
   }
@@ -88,6 +93,12 @@ export const handlers = {
 
   // Ley 1581: se elimina el userId de los agregados.
   'account.deleted': async (d, e, db) => {
+    // Lápida primero: un snapshot de evento que llegue tarde ya no puede volver a escribir este organizerId.
+    await db.collection('deleted_accounts').updateOne(
+      { _id: d.userId },
+      { $setOnInsert: { deletedAt: new Date(d.deletedAt ?? Date.now()) } },
+      { upsert: true },
+    );
     await db.collection('user_activity').deleteOne({ _id: d.userId });
     await db.collection('merchant_stats').deleteOne({ _id: d.userId });
     await db.collection('event_stats').updateMany({ organizerId: d.userId }, { $set: { organizerId: null } });
@@ -112,7 +123,12 @@ export const handlers = {
     await incDaily(db, day(d.verifiedAt), { merchantsVerified: 1 });
   },
   'report.created': async (d, e, db) => {
-    await db.collection('reports').updateOne({ _id: d.reportId }, { $set: { createdAt: new Date(d.createdAt), targetType: d.targetType, reason: d.reason, resolvedAt: null } }, { upsert: true });
+    // resolvedAt va en $setOnInsert: si report.resolved llegó antes, la resolución ya registrada no se borra.
+    await db.collection('reports').updateOne(
+      { _id: d.reportId },
+      { $set: { createdAt: new Date(d.createdAt), targetType: d.targetType, reason: d.reason }, $setOnInsert: { resolvedAt: null } },
+      { upsert: true },
+    );
     await incDaily(db, day(d.createdAt), { reports: 1, [`reportReasons.${d.reason}`]: 1 });
   },
   'report.resolved': async (d, e, db) => {
