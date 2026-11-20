@@ -52,12 +52,26 @@ const incDaily = (db, date, inc) => applyOnce(db, 'platform_daily', date, inc);
 /**
  * Reclama el tiempo de resolución de un reporte: solo una de las dos entregas (created o resolved) puede
  * medirlo, porque el cambio a `resolutionCounted` es una escritura condicional y atómica por documento.
+ *
+ * El reclamo guarda qué mensaje lo hizo (`resolutionCountedBy`). Si el proceso cae entre el reclamo y el
+ * incremento, la redelivery del MISMO mensaje vuelve a ganar el reclamo y repite el incremento, que es
+ * idempotente por mensaje (applyOnce): el KPI no se pierde ni se cuenta dos veces.
  */
 async function claimResolutionTime(db, reportId) {
+  const effectId = db.effectId;
+  if (!effectId) {
+    const res = await db
+      .collection('reports')
+      .updateOne({ _id: reportId, resolutionCounted: { $ne: true } }, { $set: { resolutionCounted: true } });
+    return res.modifiedCount === 1;
+  }
   const res = await db
     .collection('reports')
-    .updateOne({ _id: reportId, resolutionCounted: { $ne: true } }, { $set: { resolutionCounted: true } });
-  return res.modifiedCount === 1;
+    .updateOne(
+      { _id: reportId, $or: [{ resolutionCounted: { $ne: true } }, { resolutionCountedBy: effectId }] },
+      { $set: { resolutionCounted: true, resolutionCountedBy: effectId } },
+    );
+  return res.matchedCount === 1;
 }
 
 // Una cuenta borrada (lápida) no vuelve a tener actividad: una entrega tardía no recrea su registro.
@@ -97,6 +111,21 @@ async function setAttendeeCount(db, eventId, attendeeCount, attendanceVersion) {
   await db.collection('event_stats').updateOne(filter, {
     $set: { attendeeCount, ...(Number.isInteger(attendanceVersion) ? { attendeeCountVersion: attendanceVersion } : {}) },
   });
+}
+
+/**
+ * Escritura versionada de event_stats: solo se aplica si `version` es mayor que la guardada. Un único upsert
+ * condicional; si dos versiones llegan a la vez y el documento no existe, la que pierde la carrera recibe
+ * 11000 y repite la escritura condicional (así la versión mayor siempre gana).
+ */
+async function setEventVersioned(db, eventId, version, fields) {
+  const filter = { _id: eventId, $or: [{ version: { $exists: false } }, { version: { $lt: version } }] };
+  try {
+    await db.collection('event_stats').updateOne(filter, { $set: { ...fields, version }, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+  } catch (err) {
+    if (err?.code !== 11000) throw err;
+    await db.collection('event_stats').updateOne(filter, { $set: { ...fields, version } });
+  }
 }
 
 /** event.published / event.updated: metadatos del evento (snapshot completo, se ignoran versiones viejas). */
@@ -207,7 +236,8 @@ export const handlers = {
   'event.published': eventSnapshot,
   'event.updated': eventSnapshot,
   'event.rescheduled': (d, e, db) => incEvent(db, d.eventId, { rescheduledCount: 1 }),
-  'event.cancelled': (d, e, db) => incEvent(db, d.eventId, {}, { status: 'cancelled', cancelledAt: new Date(d.cancelledAt) }),
+  // Versionado como el snapshot: un event.updated atrasado (versión menor) no reabre un evento cancelado.
+  'event.cancelled': (d, e, db) => setEventVersioned(db, d.eventId, d.version, { status: 'cancelled', cancelledAt: new Date(d.cancelledAt) }),
   'event.sold_out': (d, e, db) => incEvent(db, d.eventId, {}, { soldOutAt: new Date(d.soldOutAt) }),
   'event.expired': (d, e, db) => incEvent(db, d.eventId, {}, { status: 'expired', expiredAt: new Date(d.expiredAt) }),
   // Orden: primero lo idempotente (touchUser), al final el único $inc. Si falla algo a mitad, el
