@@ -52,7 +52,10 @@ describe.skipIf(!MONGO || !hasContracts)('analytics-service con MongoDB', () => 
 
   it('procesa el ejemplo de cada contrato sin errores', async () => {
     let i = 0;
-    for (const { eventType, data } of consumedExamples()) {
+    // La cancelación va al final, como en la vida real: está versionada y una publicación con versión menor
+    // que llegara después ya no se aplicaría.
+    const ordered = consumedExamples().sort((a, b) => (a.eventType === 'event.cancelled') - (b.eventType === 'event.cancelled'));
+    for (const { eventType, data } of ordered) {
       if (eventType === 'account.deleted') continue; // se prueba aparte
       await handlers[eventType](data, { eventId: `ex-${i++}`, eventType }, db);
     }
@@ -238,4 +241,39 @@ describe.skipIf(!MONGO || !hasContracts)('analytics-service con MongoDB', () => 
     expect(await db.collection('merchant_stats').countDocuments({ _id: userId })).toBe(0);
     expect(await db.collection('user_activity').countDocuments({ _id: userId })).toBe(0);
   });
+it('una actualización atrasada no reabre un evento cancelado (snapshot v1, cancelación v3, actualización v2)', async () => {
+    const example = consumedExamples().find((x) => x.eventType === 'event.updated').data;
+    const eventId = '8a1c2b8e-3a1d-4c3e-9b0a-1f2e3d4c5b6c';
+    await handlers['event.published']({ ...example, eventId, version: 1, status: 'published' }, { eventId: 'snap-1', eventType: 'event.published' }, db);
+    await handlers['event.cancelled'](
+      { eventId, organizerId: example.organizerId, title: example.title, reason: 'organizer', cancelledAt: new Date().toISOString(), version: 3 },
+      { eventId: 'cancel-3', eventType: 'event.cancelled' },
+      db,
+    );
+    await handlers['event.updated']({ ...example, eventId, version: 2, status: 'published' }, { eventId: 'upd-2', eventType: 'event.updated' }, db);
+    const stats = await db.collection('event_stats').findOne({ _id: eventId });
+    expect(stats.status).toBe('cancelled');
+    expect(stats.version).toBe(3);
+  });
+
+  it('si el proceso cae entre el reclamo y el incremento, la redelivery sí suma el tiempo de resolución una vez', async () => {
+    const reportId = '9a1c2b8e-3a1d-4c3e-9b0a-1f2e3d4c5b6d';
+    const createdAt = '2026-11-10T10:00:00Z';
+    const resolvedAt = '2026-11-10T12:00:00Z';
+    const scoped = (effectId) => ({ collection: (name) => db.collection(name), effectId });
+    await handlers['report.created']({ reportId, createdAt, targetType: 'event', reason: 'spam' }, { eventId: 'rep-c', eventType: 'report.created' }, scoped('rep-c'));
+    const msg = { reportId, resolvedAt, outcome: 'dismissed' };
+
+    // Primera entrega: el reclamo se escribe y el proceso cae antes del incremento diario.
+    const crashing = { collection: (name) => (name === 'platform_daily' ? { updateOne: () => Promise.reject(new Error('caída')) } : db.collection(name)), effectId: 'rep-r' };
+    await expect(handlers['report.resolved'](msg, { eventId: 'rep-r', eventType: 'report.resolved' }, crashing)).rejects.toThrow('caída');
+
+    // Redelivery del mismo mensaje y una entrega duplicada: el KPI se suma una sola vez.
+    await handlers['report.resolved'](msg, { eventId: 'rep-r', eventType: 'report.resolved' }, scoped('rep-r'));
+    await handlers['report.resolved'](msg, { eventId: 'rep-r', eventType: 'report.resolved' }, scoped('rep-r'));
+    const daily = await db.collection('platform_daily').findOne({ _id: '2026-11-10' });
+    expect(daily.reportResolutionMs).toBe(2 * 3600 * 1000);
+    expect(daily.reportsResolved).toBe(1);
+  });
 });
+
