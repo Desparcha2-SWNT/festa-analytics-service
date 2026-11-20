@@ -275,5 +275,36 @@ it('una actualización atrasada no reabre un evento cancelado (snapshot v1, canc
     expect(daily.reportResolutionMs).toBe(2 * 3600 * 1000);
     expect(daily.reportsResolved).toBe(1);
   });
+it('merchant.verified deja persistido el comercio verificado en merchant_stats', async () => {
+    const userId = '5c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f';
+    const data = { ...consumedExamples().find((x) => x.eventType === 'merchant.verified').data, userId };
+    await handlers['merchant.verified'](data, { eventId: 'mv-1', eventType: 'merchant.verified' }, db);
+    const doc = await db.collection('merchant_stats').findOne({ _id: userId });
+    expect(doc).toMatchObject({ merchantId: data.merchantId, businessName: data.businessName, category: data.category, status: 'verified' });
+    expect(doc.verifiedAt.toISOString()).toBe(new Date(data.verifiedAt).toISOString());
+  });
+
+  it('los resultados de los reportes (dismissed y action_taken) quedan persistidos en reports y en el día', async () => {
+    const base = consumedExamples().find((x) => x.eventType === 'report.resolved').data;
+    const created = consumedExamples().find((x) => x.eventType === 'report.created').data;
+    const cases = [
+      ['d1c2b8e0-3a1d-4c3e-9b0a-1f2e3d4c5b01', 'dismissed'],
+      ['d1c2b8e0-3a1d-4c3e-9b0a-1f2e3d4c5b02', 'action_taken'],
+    ];
+    const day = '2026-11-12';
+    for (const [reportId, outcome] of cases) {
+      await handlers['report.created']({ ...created, reportId, createdAt: `${day}T08:00:00Z` }, { eventId: `c-${outcome}`, eventType: 'report.created' }, db);
+      await handlers['report.resolved']({ ...base, reportId, outcome, resolvedAt: `${day}T09:00:00Z` }, { eventId: `r-${outcome}`, eventType: 'report.resolved' }, db);
+      const doc = await db.collection('reports').findOne({ _id: reportId });
+      expect(doc.outcome).toBe(outcome);
+      expect(doc.resolvedAt.toISOString()).toBe(`${day}T09:00:00.000Z`);
+      expect(doc.resolutionCounted).toBe(true);
+    }
+    const daily = await db.collection('platform_daily').findOne({ _id: day });
+    expect(daily.reportsResolved).toBe(2);
+    expect(daily.reportOutcomes).toEqual({ dismissed: 1, action_taken: 1 });
+    expect(daily.reportResolutionMs).toBe(2 * 3600 * 1000);
+  });
 });
+
 

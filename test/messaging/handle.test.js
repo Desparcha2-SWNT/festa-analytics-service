@@ -212,6 +212,37 @@ describe('handle', () => {
     expect(h.handler).not.toHaveBeenCalled();
   });
 
+  it('con exchange vacío, un x-origin-exchange sin firma válida va a la DLQ', async () => {
+    // Quien publica directo en la inbox (credenciales de RabbitMQ compartidas) llega con exchange vacío.
+    for (const headers of [
+      { 'x-origin-exchange': 'festa.auth' },
+      { 'x-origin-exchange': 'festa.auth', 'x-origin-signature': 'ab'.repeat(32) },
+    ]) {
+      h.handler.mockReset();
+      const channel = fakeChannel();
+      const msg = msgWith(envelope, '', headers);
+      await _internal.handle(channel, msg, fakeRegistry(), fakeDb());
+      expect(channel.nack).toHaveBeenCalledWith(msg, false, false);
+      expect(h.handler).not.toHaveBeenCalled();
+    }
+  });
+
+  it('la firma de un reintento no sirve para otro mensaje', async () => {
+    const channel = fakeChannel();
+    channel.sendToQueue.mockImplementation((q, c, o, cb) => cb(null));
+    h.handler.mockReset().mockRejectedValue(new Error('falla'));
+    await _internal.handle(channel, msgWith(envelope), fakeRegistry(), fakeDb());
+    const [, , options] = channel.sendToQueue.mock.calls[0];
+
+    h.handler.mockReset();
+    const other = { ...envelope, eventId: 'otro-evento' };
+    const forged = { content: Buffer.from(JSON.stringify(other)), properties: options, fields: { exchange: '' } };
+    const channel2 = fakeChannel();
+    await _internal.handle(channel2, forged, fakeRegistry(), fakeDb());
+    expect(channel2.nack).toHaveBeenCalledWith(forged, false, false);
+    expect(h.handler).not.toHaveBeenCalled();
+  });
+
   it('agotados los reintentos va a la DLQ', async () => {
     const channel = fakeChannel();
     const msg = msgWith(envelope, 'festa.auth', { 'x-retry-count': 3 });
