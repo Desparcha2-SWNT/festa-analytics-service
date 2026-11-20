@@ -193,4 +193,49 @@ describe.skipIf(!MONGO || !hasContracts)('analytics-service con MongoDB', () => 
     expect(await db.collection('event_stats').countDocuments({ organizerId: ORGANIZER })).toBe(0);
     expect(await db.collection('merchant_stats').countDocuments({ _id: ORGANIZER })).toBe(0);
   });
+
+  it('attendeeCount solo avanza con una attendanceVersion mayor: un mensaje atrasado no pisa el total más nuevo', async () => {
+    const eventId = '7a1c2b8e-3a1d-4c3e-9b0a-1f2e3d4c5b6b';
+    const base = { eventId, userId: '2c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f', source: 'rsvp', reason: 'user', confirmedAt: new Date().toISOString() };
+    const ctx = (id) => ({ eventId: id, eventType: 'attendance.confirmed' });
+    await handlers['attendance.confirmed']({ ...base, attendeeCount: 5, attendanceVersion: 5 }, ctx('v5'), db);
+    await handlers['attendance.confirmed']({ ...base, attendeeCount: 4, attendanceVersion: 4 }, ctx('v4'), db); // llega tarde
+    await handlers['attendance.cancelled']({ ...base, attendeeCount: 3, attendanceVersion: 3 }, ctx('v3'), db); // también
+    let stats = await db.collection('event_stats').findOne({ _id: eventId });
+    expect(stats.attendeeCount).toBe(5);
+    expect(stats.attendeeCountVersion).toBe(5);
+    // Los contadores sí cuentan cada mensaje, llegue en el orden que llegue.
+    expect(stats.confirmations.rsvp).toBe(2);
+    expect(stats.cancellations).toBe(1);
+
+    await handlers['attendance.cancelled']({ ...base, attendeeCount: 4, attendanceVersion: 6 }, ctx('v6'), db);
+    stats = await db.collection('event_stats').findOne({ _id: eventId });
+    expect(stats.attendeeCount).toBe(4);
+    expect(stats.attendeeCountVersion).toBe(6);
+    await handlers['attendance.cancelled']({ ...base, attendeeCount: 4, attendanceVersion: 6 }, ctx('v6'), db); // misma versión: idempotente
+    expect((await db.collection('event_stats').findOne({ _id: eventId })).attendeeCount).toBe(4);
+  });
+
+  it('una cuenta borrada no recrea merchant_stats ni user_activity con entregas tardías', async () => {
+    const userId = '3c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f';
+    await handlers['account.deleted']({ userId, deletedAt: new Date().toISOString() }, { eventType: 'account.deleted' }, db);
+    const now = new Date().toISOString();
+    await handlers['description.generated'](
+      { requestedBy: userId, generatedAt: now, inputTokens: 10, outputTokens: 20 },
+      { eventId: 'late-desc', eventType: 'description.generated' },
+      db,
+    );
+    await handlers['payout.recorded'](
+      { organizerId: userId, merchantId: '4c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f', amountCents: 1000, paidAt: now },
+      { eventId: 'late-payout', eventType: 'payout.recorded' },
+      db,
+    );
+    await handlers['merchant.verified'](
+      { userId, merchantId: '4c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f', businessName: 'X', category: 'cafe', verifiedAt: now },
+      { eventId: 'late-verified', eventType: 'merchant.verified' },
+      db,
+    );
+    expect(await db.collection('merchant_stats').countDocuments({ _id: userId })).toBe(0);
+    expect(await db.collection('user_activity').countDocuments({ _id: userId })).toBe(0);
+  });
 });

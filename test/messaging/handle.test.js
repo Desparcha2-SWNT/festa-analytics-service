@@ -186,6 +186,32 @@ describe('handle', () => {
     expect(channel.ack).toHaveBeenCalledWith(msg);
   });
 
+  it('el reintento conserva el exchange de origen y al volver por la cola de reintento sí se procesa', async () => {
+    const channel = fakeChannel();
+    channel.sendToQueue.mockImplementation((q, c, o, cb) => cb(null));
+    const first = msgWith(envelope);
+    await _internal.handle(channel, first, fakeRegistry(), fakeDb());
+    const [, content, options] = channel.sendToQueue.mock.calls[0];
+    expect(options.headers['x-origin-exchange']).toBe('festa.auth');
+
+    // Lo que ve la inbox en la segunda entrega: el dead-letter por el exchange por defecto deja `fields.exchange` vacío.
+    h.handler.mockReset();
+    const second = { content, properties: options, fields: { exchange: '' } };
+    const channel2 = fakeChannel();
+    await _internal.handle(channel2, second, fakeRegistry(), fakeDb());
+    expect(h.handler).toHaveBeenCalledTimes(1);
+    expect(channel2.ack).toHaveBeenCalledWith(second);
+    expect(channel2.nack).not.toHaveBeenCalled();
+  });
+
+  it('un x-origin-exchange forjado en un mensaje que llegó directo no cambia el exchange verificado', async () => {
+    const channel = fakeChannel();
+    const msg = msgWith(envelope, 'festa.otro', { 'x-origin-exchange': 'festa.auth' });
+    await _internal.handle(channel, msg, fakeRegistry(), fakeDb());
+    expect(channel.nack).toHaveBeenCalledWith(msg, false, false);
+    expect(h.handler).not.toHaveBeenCalled();
+  });
+
   it('agotados los reintentos va a la DLQ', async () => {
     const channel = fakeChannel();
     const msg = msgWith(envelope, 'festa.auth', { 'x-retry-count': 3 });
