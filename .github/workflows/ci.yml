@@ -31,7 +31,7 @@ jobs:
       codeql-language: javascript-typescript
 
   node:
-    name: Linter y pruebas (Node 20)
+    name: Linter y pruebas (Node 22)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -55,7 +55,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
 
       - run: npm ci

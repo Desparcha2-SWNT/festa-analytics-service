@@ -5,6 +5,8 @@ import { handlers } from '../../src/messaging/handlers.js';
 function fakeDb() {
   const calls = [];
   const collection = (name) => ({
+    // La cuenta no está borrada (sin lápida): no cambia el orden de las escrituras.
+    findOne: vi.fn(async () => null),
     updateOne: vi.fn(async () => {
       calls.push(name);
       return {};

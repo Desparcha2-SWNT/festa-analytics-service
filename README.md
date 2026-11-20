@@ -28,7 +28,7 @@ Todas con JWT. El cliente las llama con el prefijo `/api`.
 |---|---|---|
 | `GET /analytics/merchants/me` | Cualquier organizador | Panel RF15: totales y detalle por evento (conteos simples) |
 | `GET /analytics/events/{id}` | Organizador del evento o admin | Detalle de un evento |
-| `GET /analytics/admin/overview?days=30` | Admin | KPIs RN4: usuarios activos (7 y 30 días) y recurrentes (3+ días), comercios pendientes y verificados, ventas y comisión, moderación, costo de IA, top de eventos |
+| `GET /analytics/admin/overview?days=30` | Admin | KPIs RN4: usuarios activos (7 y 30 días) y recurrentes (3+ días), comercios pendientes y verificados, ventas y comisión, moderación, uso de IA (tokens de entrada y salida; sin costo calculado), top de eventos |
 | `GET /health`, `GET /metrics` | — | Estado y métricas |
 
 ## Correr en local

@@ -49,14 +49,28 @@ const incEvent = (db, eventId, inc, set = {}) => applyOnce(db, 'event_stats', ev
 const incDaily = (db, date, inc) => applyOnce(db, 'platform_daily', date, inc);
 
 /** RN4: actividad por usuario y día (usuarios recurrentes vs. que solo descargan). */
-const touchUser = (db, userId, iso) =>
-  userId
-    ? db.collection('user_activity').updateOne(
-        { _id: userId },
-        { $addToSet: { activeDays: day(iso) }, $min: { firstSeen: new Date(iso ?? Date.now()) }, $max: { lastSeen: new Date(iso ?? Date.now()) } },
-        { upsert: true },
-      )
-    : undefined;
+/**
+ * Reclama el tiempo de resolución de un reporte: solo una de las dos entregas (created o resolved) puede
+ * medirlo, porque el cambio a `resolutionCounted` es una escritura condicional y atómica por documento.
+ */
+async function claimResolutionTime(db, reportId) {
+  const res = await db
+    .collection('reports')
+    .updateOne({ _id: reportId, resolutionCounted: { $ne: true } }, { $set: { resolutionCounted: true } });
+  return res.modifiedCount === 1;
+}
+
+// Una cuenta borrada (lápida) no vuelve a tener actividad: una entrega tardía no recrea su registro.
+const isDeleted = async (db, userId) => Boolean(userId) && (await db.collection('deleted_accounts').findOne({ _id: userId })) !== null;
+
+const touchUser = async (db, userId, iso) => {
+  if (!userId || (await isDeleted(db, userId))) return undefined;
+  return db.collection('user_activity').updateOne(
+    { _id: userId },
+    { $addToSet: { activeDays: day(iso) }, $min: { firstSeen: new Date(iso ?? Date.now()) }, $max: { lastSeen: new Date(iso ?? Date.now()) } },
+    { upsert: true },
+  );
+};
 
 /** event.published / event.updated: metadatos del evento (snapshot completo, se ignoran versiones viejas). */
 async function eventSnapshot(d, e, db) {
@@ -74,13 +88,14 @@ async function eventSnapshot(d, e, db) {
     status: d.status,
     version: d.version,
   };
-  const res = await db.collection('event_stats').updateOne(
-    { _id: d.eventId, $or: [{ version: { $exists: false } }, { version: { $lt: d.version } }] },
-    { $set: meta, $setOnInsert: { createdAt: new Date() } },
-  );
-  if (res.matchedCount === 0) {
-    // No existe todavía, o existe con una versión >= (mensaje viejo): se inserta solo si no existe.
-    await db.collection('event_stats').updateOne({ _id: d.eventId }, { $setOnInsert: { ...meta, createdAt: new Date() } }, { upsert: true });
+  // Un único upsert condicional: si dos versiones llegan a la vez y el documento no existe, la que pierde
+  // la carrera recibe 11000 y repite la escritura condicional (así la versión mayor siempre gana).
+  const filter = { _id: d.eventId, $or: [{ version: { $exists: false } }, { version: { $lt: d.version } }] };
+  try {
+    await db.collection('event_stats').updateOne(filter, { $set: meta, $setOnInsert: { createdAt: new Date() } }, { upsert: true });
+  } catch (err) {
+    if (err?.code !== 11000) throw err;
+    await db.collection('event_stats').updateOne(filter, { $set: meta });
   }
   // Si el organizador ya se borró (lápida de account.deleted), el snapshot que llegó tarde no debe dejar su id.
   // Se comprueba después de escribir: cubre tanto el orden snapshot→borrado como borrado→snapshot.
@@ -115,19 +130,23 @@ export const handlers = {
 
   // ---------------------------------------------------------------- comercios y reportes
   'merchant.submitted': async (d, e, db) => {
-    await db.collection('merchant_stats').updateOne(
+    if (!(await isDeleted(db, d.userId))) {
+      await db.collection('merchant_stats').updateOne(
       { _id: d.userId },
-      { $set: { merchantId: d.merchantId, businessName: d.businessName, category: d.category, status: 'pending', submittedAt: new Date(d.submittedAt) } },
-      { upsert: true },
-    );
+        { $set: { merchantId: d.merchantId, businessName: d.businessName, category: d.category, status: 'pending', submittedAt: new Date(d.submittedAt) } },
+        { upsert: true },
+      );
+    }
     await incDaily(db, day(d.submittedAt), { merchantsSubmitted: 1 });
   },
   'merchant.verified': async (d, e, db) => {
-    await db.collection('merchant_stats').updateOne(
-      { _id: d.userId },
-      { $set: { merchantId: d.merchantId, businessName: d.businessName, category: d.category, status: 'verified', verifiedAt: new Date(d.verifiedAt) } },
-      { upsert: true },
-    );
+    if (!(await isDeleted(db, d.userId))) {
+      await db.collection('merchant_stats').updateOne(
+        { _id: d.userId },
+        { $set: { merchantId: d.merchantId, businessName: d.businessName, category: d.category, status: 'verified', verifiedAt: new Date(d.verifiedAt) } },
+        { upsert: true },
+      );
+    }
     await incDaily(db, day(d.verifiedAt), { merchantsVerified: 1 });
   },
   'report.created': async (d, e, db) => {
@@ -138,6 +157,11 @@ export const handlers = {
       { upsert: true },
     );
     await incDaily(db, day(d.createdAt), { reports: 1, [`reportReasons.${d.reason}`]: 1 });
+    // Si report.resolved llegó antes, no pudo medir el tiempo (no conocía la creación): se mide aquí.
+    const after = await db.collection('reports').findOne({ _id: d.reportId });
+    if (after?.resolvedAt && (await claimResolutionTime(db, d.reportId))) {
+      await incDaily(db, day(after.resolvedAt), { reportResolutionMs: new Date(after.resolvedAt) - new Date(d.createdAt) });
+    }
   },
   'report.resolved': async (d, e, db) => {
     const report = await db.collection('reports').findOneAndUpdate(
@@ -146,7 +170,9 @@ export const handlers = {
       { upsert: true, returnDocument: 'before', includeResultMetadata: false },
     );
     const inc = { reportsResolved: 1, [`reportOutcomes.${d.outcome}`]: 1 };
-    if (report?.createdAt) inc.reportResolutionMs = new Date(d.resolvedAt) - report.createdAt;
+    if (report?.createdAt && (await claimResolutionTime(db, d.reportId))) {
+      inc.reportResolutionMs = new Date(d.resolvedAt) - report.createdAt;
+    }
     await incDaily(db, day(d.resolvedAt), inc);
   },
 

@@ -34,10 +34,33 @@ export function toEventSummary(s) {
 
 /** RF15 / RN5: panel del organizador (comercio o usuario) con totales y detalle por evento. */
 export async function organizerDashboard(userId, db = getDb()) {
-  const events = await db.collection('event_stats').find({ organizerId: userId }).sort({ startsAt: -1 }).limit(200).toArray();
-  const merchant = await db.collection('merchant_stats').findOne({ _id: userId });
+  // Los totales suman TODOS los eventos del organizador; el límite de 200 solo recorta el detalle.
+  const [events, [agg] = [], merchant] = await Promise.all([
+    db.collection('event_stats').find({ organizerId: userId }).sort({ startsAt: -1 }).limit(200).toArray(),
+    db
+      .collection('event_stats')
+      .aggregate([
+        { $match: { organizerId: userId } },
+        {
+          $group: {
+            _id: null,
+            events: { $sum: 1 },
+            attendees: { $sum: { $ifNull: ['$attendeeCount', 0] } },
+            checkIns: { $sum: { $ifNull: ['$checkIns', 0] } },
+            views: { $sum: { $ifNull: ['$views.total', 0] } },
+            shares: { $sum: { $ifNull: ['$shares', 0] } },
+            recommendedByAi: { $sum: { $ifNull: ['$recommended', 0] } },
+            pushReach: { $sum: { $ifNull: ['$pushReach', 0] } },
+            ticketsSold: { $sum: { $ifNull: ['$ticketsSold', 0] } },
+            grossCents: { $sum: { $ifNull: ['$grossCents', 0] } },
+          },
+        },
+      ])
+      .toArray(),
+    db.collection('merchant_stats').findOne({ _id: userId }),
+  ]);
   const items = events.map(toEventSummary);
-  const sum = (key) => items.reduce((acc, e) => acc + e[key], 0);
+  const num = (key) => agg?.[key] ?? 0;
   return {
     merchant: merchant
       ? {
@@ -50,15 +73,15 @@ export async function organizerDashboard(userId, db = getDb()) {
         }
       : null,
     totals: {
-      events: items.length,
-      attendees: sum('attendees'),
-      checkIns: sum('checkIns'),
-      views: sum('views'),
-      shares: sum('shares'),
-      recommendedByAi: sum('recommendedByAi'),
-      pushReach: sum('pushReach'),
-      ticketsSold: sum('ticketsSold'),
-      grossCents: sum('grossCents'),
+      events: num('events'),
+      attendees: num('attendees'),
+      checkIns: num('checkIns'),
+      views: num('views'),
+      shares: num('shares'),
+      recommendedByAi: num('recommendedByAi'),
+      pushReach: num('pushReach'),
+      ticketsSold: num('ticketsSold'),
+      grossCents: num('grossCents'),
     },
     events: items,
   };
