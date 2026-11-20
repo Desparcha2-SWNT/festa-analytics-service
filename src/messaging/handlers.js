@@ -63,14 +63,41 @@ async function claimResolutionTime(db, reportId) {
 // Una cuenta borrada (lápida) no vuelve a tener actividad: una entrega tardía no recrea su registro.
 const isDeleted = async (db, userId) => Boolean(userId) && (await db.collection('deleted_accounts').findOne({ _id: userId })) !== null;
 
-const touchUser = async (db, userId, iso) => {
+/**
+ * Escribe un documento ligado a una cuenta sin recrear actividad de una cuenta borrada. Se comprueba la
+ * lápida antes y también después de escribir: si account.deleted corrió justo entre la comprobación y la
+ * escritura (entrega concurrente o tardía), el documento recién creado se borra de nuevo.
+ */
+async function writeUnlessDeleted(db, collection, userId, write) {
   if (!userId || (await isDeleted(db, userId))) return undefined;
-  return db.collection('user_activity').updateOne(
-    { _id: userId },
-    { $addToSet: { activeDays: day(iso) }, $min: { firstSeen: new Date(iso ?? Date.now()) }, $max: { lastSeen: new Date(iso ?? Date.now()) } },
-    { upsert: true },
+  const result = await write();
+  if (await isDeleted(db, userId)) await db.collection(collection).deleteOne({ _id: userId });
+  return result;
+}
+
+const touchUser = (db, userId, iso) =>
+  writeUnlessDeleted(db, 'user_activity', userId, () =>
+    db.collection('user_activity').updateOne(
+      { _id: userId },
+      { $addToSet: { activeDays: day(iso) }, $min: { firstSeen: new Date(iso ?? Date.now()) }, $max: { lastSeen: new Date(iso ?? Date.now()) } },
+      { upsert: true },
+    ),
   );
-};
+
+/**
+ * attendeeCount es el total vigente, no un delta: un mensaje atrasado no puede pisar uno más nuevo. Booking sube
+ * attendanceVersion en 1 con cada cambio (contrato x-version 2) y solo se guarda una versión mayor a la guardada:
+ * una sola escritura condicional por documento (Mongo corre sin transacciones).
+ */
+async function setAttendeeCount(db, eventId, attendeeCount, attendanceVersion) {
+  const filter = { _id: eventId };
+  if (Number.isInteger(attendanceVersion)) {
+    filter.$or = [{ attendeeCountVersion: { $exists: false } }, { attendeeCountVersion: { $lt: attendanceVersion } }];
+  }
+  await db.collection('event_stats').updateOne(filter, {
+    $set: { attendeeCount, ...(Number.isInteger(attendanceVersion) ? { attendeeCountVersion: attendanceVersion } : {}) },
+  });
+}
 
 /** event.published / event.updated: metadatos del evento (snapshot completo, se ignoran versiones viejas). */
 async function eventSnapshot(d, e, db) {
@@ -130,23 +157,23 @@ export const handlers = {
 
   // ---------------------------------------------------------------- comercios y reportes
   'merchant.submitted': async (d, e, db) => {
-    if (!(await isDeleted(db, d.userId))) {
-      await db.collection('merchant_stats').updateOne(
-      { _id: d.userId },
+    await writeUnlessDeleted(db, 'merchant_stats', d.userId, () =>
+      db.collection('merchant_stats').updateOne(
+        { _id: d.userId },
         { $set: { merchantId: d.merchantId, businessName: d.businessName, category: d.category, status: 'pending', submittedAt: new Date(d.submittedAt) } },
         { upsert: true },
-      );
-    }
+      ),
+    );
     await incDaily(db, day(d.submittedAt), { merchantsSubmitted: 1 });
   },
   'merchant.verified': async (d, e, db) => {
-    if (!(await isDeleted(db, d.userId))) {
-      await db.collection('merchant_stats').updateOne(
+    await writeUnlessDeleted(db, 'merchant_stats', d.userId, () =>
+      db.collection('merchant_stats').updateOne(
         { _id: d.userId },
         { $set: { merchantId: d.merchantId, businessName: d.businessName, category: d.category, status: 'verified', verifiedAt: new Date(d.verifiedAt) } },
         { upsert: true },
-      );
-    }
+      ),
+    );
     await incDaily(db, day(d.verifiedAt), { merchantsVerified: 1 });
   },
   'report.created': async (d, e, db) => {
@@ -195,17 +222,17 @@ export const handlers = {
   },
 
   // ---------------------------------------------------------------- asistencia
-  // attendeeCount trae el total vigente; se guarda tal cual (no se suma) y además se cuentan las altas.
+  // attendeeCount trae el total vigente: se guarda solo si su attendanceVersion es mayor (ver setAttendeeCount);
+  // además se cuentan las altas y las bajas.
   'attendance.confirmed': async (d, e, db) => {
     await touchUser(db, d.userId, d.confirmedAt);
-    await incEvent(
-      db,
-      d.eventId,
-      { [d.source === 'ticket' ? 'confirmations.ticket' : 'confirmations.rsvp']: 1 },
-      { attendeeCount: d.attendeeCount },
-    );
+    await incEvent(db, d.eventId, { [d.source === 'ticket' ? 'confirmations.ticket' : 'confirmations.rsvp']: 1 });
+    await setAttendeeCount(db, d.eventId, d.attendeeCount, d.attendanceVersion);
   },
-  'attendance.cancelled': (d, e, db) => incEvent(db, d.eventId, { cancellations: 1, [`cancellationReasons.${d.reason}`]: 1 }, { attendeeCount: d.attendeeCount }),
+  'attendance.cancelled': async (d, e, db) => {
+    await incEvent(db, d.eventId, { cancellations: 1, [`cancellationReasons.${d.reason}`]: 1 });
+    await setAttendeeCount(db, d.eventId, d.attendeeCount, d.attendanceVersion);
+  },
   'pass.checked_in': async (d, e, db) => {
     await touchUser(db, d.userId, d.checkedInAt);
     await incEvent(db, d.eventId, { checkIns: 1 });
@@ -232,13 +259,17 @@ export const handlers = {
     await incDaily(db, day(d.refundedAt), { refundedCents: d.amountCents });
   },
   'payout.recorded': async (d, e, db) => {
-    await applyOnce(db, 'merchant_stats', d.organizerId, { payoutsCents: d.amountCents, payoutCount: 1 }, { merchantId: d.merchantId, lastPayoutAt: new Date(d.paidAt) });
+    await writeUnlessDeleted(db, 'merchant_stats', d.organizerId, () =>
+      applyOnce(db, 'merchant_stats', d.organizerId, { payoutsCents: d.amountCents, payoutCount: 1 }, { merchantId: d.merchantId, lastPayoutAt: new Date(d.paidAt) }),
+    );
   },
 
   // ---------------------------------------------------------------- IA y push
   'description.generated': async (d, e, db) => {
     await incDaily(db, day(d.generatedAt), { aiDescriptions: 1, aiInputTokens: d.inputTokens, aiOutputTokens: d.outputTokens });
-    await applyOnce(db, 'merchant_stats', d.requestedBy, { aiDescriptions: 1, aiTokens: d.inputTokens + d.outputTokens });
+    await writeUnlessDeleted(db, 'merchant_stats', d.requestedBy, () =>
+      applyOnce(db, 'merchant_stats', d.requestedBy, { aiDescriptions: 1, aiTokens: d.inputTokens + d.outputTokens }),
+    );
   },
   'recommendation.served': async (d, e, db) => {
     await incDaily(db, day(d.servedAt), { aiRecommendations: 1, aiInputTokens: d.inputTokens, aiOutputTokens: d.outputTokens });
