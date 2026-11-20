@@ -56,8 +56,9 @@ async function handle(channel, msg, registry, db = undefined) {
   }
 
   const expectedExchange = registry.getExpectedExchange(envelope.eventType);
-  if (expectedExchange && msg.fields.exchange !== expectedExchange) {
-    logger.error({ expectedExchange, actual: msg.fields.exchange }, 'llegó por un exchange distinto al de su esquema, va directo a la DLQ');
+  const origin = originExchange(msg);
+  if (expectedExchange && origin !== expectedExchange) {
+    logger.error({ expectedExchange, actual: origin }, 'llegó por un exchange distinto al de su esquema, va directo a la DLQ');
     return channel.nack(msg, false, false);
   }
 
@@ -145,6 +146,18 @@ export async function claimEvent(processed, envelope, now = new Date(), leaseMs 
   return taken ? { state: 'claimed', token } : { state: 'busy' };
 }
 
+/**
+ * Exchange por el que llegó el mensaje originalmente. Un reintento vuelve a la inbox desde la cola de
+ * reintento (dead-letter por el exchange por defecto, así `fields.exchange` llega vacío): su origen va
+ * en el header `x-origin-exchange`. El header solo se lee en ese caso, así uno forjado en un mensaje que
+ * llegó directo no cambia el exchange verificado.
+ */
+function originExchange(msg) {
+  const exchange = msg.fields?.exchange ?? '';
+  if (exchange !== '') return exchange;
+  return msg.properties?.headers?.['x-origin-exchange'] ?? '';
+}
+
 async function handleFailure(channel, msg, envelope, err) {
   const rawRetryCount = msg.properties.headers?.['x-retry-count'] ?? 0;
   const retryCount = Number(rawRetryCount);
@@ -164,7 +177,10 @@ async function handleFailure(channel, msg, envelope, err) {
       channel.sendToQueue(
         RETRY_QUEUE,
         msg.content,
-        { ...msg.properties, headers: { ...msg.properties.headers, 'x-retry-count': retryCount + 1 } },
+        {
+          ...msg.properties,
+          headers: { ...msg.properties.headers, 'x-retry-count': retryCount + 1, 'x-origin-exchange': originExchange(msg) },
+        },
         (publishErr) => (publishErr ? reject(publishErr) : resolve()),
       );
     });
