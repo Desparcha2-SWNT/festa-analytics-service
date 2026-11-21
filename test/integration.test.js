@@ -305,6 +305,21 @@ it('merchant.verified deja persistido el comercio verificado en merchant_stats',
     expect(daily.reportOutcomes).toEqual({ dismissed: 1, action_taken: 1 });
     expect(daily.reportResolutionMs).toBe(2 * 3600 * 1000);
   });
+it('recommendation.served tardío de una cuenta borrada no recrea su actividad, pero sí cuenta la recomendación', async () => {
+    const userId = '6c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f';
+    const base = consumedExamples().find((x) => x.eventType === 'recommendation.served').data;
+    await handlers['account.deleted']({ userId, deletedAt: new Date().toISOString() }, { eventType: 'account.deleted' }, db);
+    const eventId = base.eventIds[0];
+    const before = (await db.collection('event_stats').findOne({ _id: eventId }))?.recommended ?? 0;
+
+    await handlers['recommendation.served']({ ...base, userId }, { eventId: 'late-reco', eventType: 'recommendation.served' }, db);
+
+    // Sin rastro de la persona: ni user_activity ni su id en ningún agregado.
+    expect(await db.collection('user_activity').countDocuments({ _id: userId })).toBe(0);
+    // El agregado anónimo sí cuenta: la recomendación ocurrió.
+    expect((await db.collection('event_stats').findOne({ _id: eventId })).recommended).toBe(before + 1);
+  });
 });
+
 
 
