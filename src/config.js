@@ -15,6 +15,21 @@ export function parseTrustProxy(value) {
   return value;
 }
 
+const MIN_RETRY_KEY_LENGTH = 16;
+
+/**
+ * Clave que firma el origen de los reintentos. Si la variable no existe se genera una por proceso (sirve con una
+ * réplica). Si existe pero está vacía o es demasiado corta se detiene el arranque: una clave vacía es conocida por
+ * todos y dejaría la firma sin ningún efecto, sin que nadie lo notara.
+ */
+export function resolveInboxRetryKey(value) {
+  if (value === undefined) return randomBytes(32).toString('hex');
+  if (value.trim().length < MIN_RETRY_KEY_LENGTH) {
+    throw new Error(`INBOX_RETRY_KEY está vacía o tiene menos de ${MIN_RETRY_KEY_LENGTH} caracteres: define una clave real (openssl rand -hex 32)`);
+  }
+  return value;
+}
+
 export const config = {
   serviceName: 'analytics-service',
   port: Number(process.env.PORT ?? 8088),
@@ -25,9 +40,8 @@ export const config = {
   jwtIssuer: required('JWT_ISSUER'),
   jwtPublicKeyPath: required('JWT_PUBLIC_KEY_PATH'),
   contractsDir: process.env.FESTA_CONTRACTS_DIR ?? path.resolve('../festa-infra/contracts'),
-  // Firma el origen de los reintentos (ver inboxConsumer.originExchange). Solo este servicio la conoce: quien
-  // publique directo en la inbox con las credenciales compartidas de RabbitMQ no puede falsificarla. Sin la
-  // variable se genera una por proceso (sirve con una réplica; con varias, todas deben compartir la misma).
-  inboxRetryKey: process.env.INBOX_RETRY_KEY ?? randomBytes(32).toString('hex'),
+  // Firma el origen de los reintentos (ver inboxConsumer.originExchange): quien publique directo en la inbox sin
+  // conocer la clave no puede falsificarlo. Con varias réplicas, todas deben compartir la misma (ver resolveInboxRetryKey).
+  inboxRetryKey: resolveInboxRetryKey(process.env.INBOX_RETRY_KEY),
   inboxRetryKeyFromEnv: Boolean(process.env.INBOX_RETRY_KEY),
 };
