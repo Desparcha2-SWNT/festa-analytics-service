@@ -210,4 +210,4 @@ async function handleFailure(channel, msg, envelope, err) {
 }
 
 // Export solo para pruebas.
-export const _internal = { handle, handleFailure };
+export const _internal = { handle, handleFailure, originExchange };
